@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
 
 # -----------------------------
 # Constants
@@ -35,11 +34,7 @@ CHANNEL_OPTIONS = [
 MESSAGE_LANG_OPTIONS = ["English", "Spanish", "Vietnamese", "Tagalog", "Multilingual"]
 
 
-# -----------------------------
-# Utility functions
-# -----------------------------
 def allocate_counts_from_percent(percent_dict, n=100):
-    """Convert % dictionary to integer counts summing exactly to n."""
     raw = {k: (v / 100.0) * n for k, v in percent_dict.items()}
     floored = {k: int(np.floor(v)) for k, v in raw.items()}
     remainder = n - sum(floored.values())
@@ -68,15 +63,11 @@ def sample_from_probs(rng, prob_dict):
     return rng.choice(keys, p=probs)
 
 
-# -----------------------------
-# Population generation
-# -----------------------------
 @st.cache_data
 def generate_population(seed=SEED):
     rng = np.random.default_rng(seed)
     n = POP_SIZE
 
-    # Approximate Santa Rosa demographic proportions
     age_counts = allocate_counts_from_percent(
         {"0-17": 20, "18-39": 29, "40-64": 33, "65+": 18}, n
     )
@@ -104,7 +95,6 @@ def generate_population(seed=SEED):
         }
     )
 
-    # English proficiency (derived from primary language)
     limited_prob_by_language = {
         "English": 0.01,
         "Spanish": 0.45,
@@ -112,13 +102,11 @@ def generate_population(seed=SEED):
         "Tagalog": 0.30,
         "Other": 0.40,
     }
-    limited_flags = []
-    for _, row in df.iterrows():
-        p_lim = limited_prob_by_language[row["primary_language"]]
-        limited_flags.append(rng.random() < p_lim)
-    df["english_proficiency"] = np.where(limited_flags, "Limited", "Proficient")
+    df["english_proficiency"] = [
+        "Limited" if rng.random() < limited_prob_by_language[lang] else "Proficient"
+        for lang in df["primary_language"]
+    ]
 
-    # Disability assignment: exactly 12 residents, weighted toward older age
     disability_target = 12
     age_weight = {"0-17": 0.7, "18-39": 0.7, "40-64": 1.2, "65+": 2.3}
     w = df["age_group"].map(age_weight).astype(float).values
@@ -128,7 +116,6 @@ def generate_population(seed=SEED):
     df["disability_status"] = "No"
     df.loc[yes_idx, "disability_status"] = "Yes"
 
-    # Occupation
     occupations = []
     for _, row in df.iterrows():
         age = row["age_group"]
@@ -156,7 +143,7 @@ def generate_population(seed=SEED):
                 "Retired": 0.05,
                 "Unemployed/Not in labor force": 0.16,
             }
-        else:  # 65+
+        else:
             probs = {
                 "Outdoor worker": 0.02,
                 "Indoor on-site": 0.04,
@@ -167,7 +154,6 @@ def generate_population(seed=SEED):
         occupations.append(sample_from_probs(rng, probs))
     df["occupation"] = occupations
 
-    # Housing type
     housing = []
     for _, row in df.iterrows():
         z = row["zip_code"]
@@ -193,7 +179,6 @@ def generate_population(seed=SEED):
         housing.append(sample_from_probs(rng, probs))
     df["housing_type"] = housing
 
-    # Cooling access
     cooling = []
     for _, row in df.iterrows():
         h = row["housing_type"]
@@ -203,12 +188,11 @@ def generate_population(seed=SEED):
             probs = {"Central AC": 0.32, "Window/portable AC": 0.30, "Fan only": 0.28, "No cooling": 0.10}
         elif h == "Mobile home":
             probs = {"Central AC": 0.20, "Window/portable AC": 0.35, "Fan only": 0.32, "No cooling": 0.13}
-        else:  # Unhoused/temporary
+        else:
             probs = {"Central AC": 0.00, "Window/portable AC": 0.00, "Fan only": 0.15, "No cooling": 0.85}
         cooling.append(sample_from_probs(rng, probs))
     df["cooling_access"] = cooling
 
-    # Technology access
     tech = []
     for _, row in df.iterrows():
         age = row["age_group"]
@@ -235,7 +219,7 @@ def generate_population(seed=SEED):
                 "Landline only": 0.10,
                 "No reliable phone/internet": 0.05,
             }
-        else:  # 65+
+        else:
             probs = {
                 "Smartphone + internet": 0.45,
                 "Smartphone (limited data)": 0.14,
@@ -254,7 +238,6 @@ def generate_population(seed=SEED):
         tech.append(sample_from_probs(rng, probs))
     df["tech_access"] = tech
 
-    # Social connectedness
     connectedness = []
     for _, row in df.iterrows():
         age = row["age_group"]
@@ -278,67 +261,44 @@ def generate_population(seed=SEED):
             probs["Highly connected"] -= 0.02
             probs["Moderately connected"] -= 0.03
 
-        # Normalize and sample
         connectedness.append(sample_from_probs(rng, probs))
     df["social_connectedness"] = connectedness
 
-    # Heat vulnerability scoring
     def vulnerability_score(row):
         score = 0
         if row["age_group"] == "65+":
             score += 2
         elif row["age_group"] == "0-17":
             score += 1
-
         if row["disability_status"] == "Yes":
             score += 2
-
         if row["cooling_access"] == "Fan only":
             score += 1
         elif row["cooling_access"] == "No cooling":
             score += 2
-
         if row["english_proficiency"] == "Limited":
             score += 1
-
         if row["social_connectedness"] == "Isolated":
             score += 1
-
         if row["occupation"] == "Outdoor worker":
             score += 1
-
         if row["housing_type"] in ["Mobile home", "Unhoused/temporary"]:
             score += 1
-
         if row["tech_access"] in ["Landline only", "No reliable phone/internet"]:
             score += 1
-
         return score
 
     df["vulnerability_score"] = df.apply(vulnerability_score, axis=1)
+    df["vulnerability_level"] = df["vulnerability_score"].apply(
+        lambda s: "High" if s >= 6 else ("Medium" if s >= 3 else "Low")
+    )
 
-    def vuln_level(score):
-        if score >= 6:
-            return "High"
-        elif score >= 3:
-            return "Medium"
-        return "Low"
-
-    df["vulnerability_level"] = df["vulnerability_score"].apply(vuln_level)
-
-    # Grid coordinates (10x10)
     df["x"] = ((df["resident_id"] - 1) % 10) + 1
     df["y"] = 10 - ((df["resident_id"] - 1) // 10)
-
-    # Contact tracking
     df["contact_count"] = 0
-
     return df
 
 
-# -----------------------------
-# Communication logic
-# -----------------------------
 def channel_reach_prob(row, channel):
     tech = row["tech_access"]
     soc = row["social_connectedness"]
@@ -411,14 +371,10 @@ def language_match_prob(row, message_language):
 
     if message_language == "Multilingual":
         return 1.0
-
     if message_language == primary:
         return 0.98
-
     if message_language == "English":
         return 0.80 if eng_prof == "Proficient" else 0.20
-
-    # Non-English message that doesn't match primary language
     return 0.15 if eng_prof == "Proficient" else 0.03
 
 
@@ -447,17 +403,14 @@ def apply_tactic(pop_df, rng, channel, message_language, intended_real_reach, fi
         return 0, 0, targeted_count, 0, fractional_bank
 
     weights = np.zeros(len(pop_df), dtype=float)
-
     for idx, row in pop_df[mask].iterrows():
-        w = channel_reach_prob(row, channel) * language_match_prob(row, message_language)
-        weights[idx] = w
+        weights[idx] = channel_reach_prob(row, channel) * language_match_prob(row, message_language)
 
     eligible_idx = np.where(weights > 0)[0]
     eligible_count = int(len(eligible_idx))
     if eligible_count == 0:
         return 0, 0, targeted_count, eligible_count, fractional_bank
 
-    # Convert intended real reach to icon units + carry fractional bank
     expected_icons = (intended_real_reach / REP_FACTOR) + fractional_bank
     to_contact = int(np.floor(expected_icons))
     new_bank = expected_icons - to_contact
@@ -491,17 +444,12 @@ def distribution_table(df, col, order=None):
     return out
 
 
-# -----------------------------
-# App UI
-# -----------------------------
 def main():
     st.set_page_config(page_title="Santa Rosa Heat Communication Simulation", layout="wide")
-
     st.title("Santa Rosa Extreme Heat Communication Simulation")
     st.caption("Live tabletop exercise tool for communication strategy testing")
     st.info("Each icon = ~1,800 residents. Synthetic population size = 100.")
 
-    # Session state
     if "population" not in st.session_state:
         st.session_state.population = generate_population().copy(deep=True)
     if "history" not in st.session_state:
@@ -513,10 +461,8 @@ def main():
 
     pop_df = st.session_state.population
 
-    # Sidebar controls
     with st.sidebar:
         st.header("Tactic Builder")
-
         channel = st.selectbox("Channel", CHANNEL_OPTIONS)
         message_language = st.selectbox("Message language", MESSAGE_LANG_OPTIONS)
 
@@ -526,7 +472,6 @@ def main():
             max_value=50000,
             value=1800,
             step=100,
-            help="Because each icon is 1,800 residents, small tactics may accumulate over several actions before changing icons.",
         )
         st.caption(f"Equivalent to {intended_reach / REP_FACTOR:.2f} icons")
 
@@ -547,17 +492,13 @@ def main():
         st.session_state.rng = np.random.default_rng(SEED)
         st.session_state.fractional_bank = 0.0
         st.success("Scenario reset complete.")
-        st.rerun()
+        if hasattr(st, "rerun"):
+            st.rerun()
+        else:
+            st.experimental_rerun()
 
     if apply_btn:
-        if (
-            len(age_filter) == 0
-            or len(zip_filter) == 0
-            or len(occ_filter) == 0
-            or len(vuln_filter) == 0
-            or len(lang_filter) == 0
-            or len(dis_filter) == 0
-        ):
+        if any(len(x) == 0 for x in [age_filter, zip_filter, occ_filter, vuln_filter, lang_filter, dis_filter]):
             st.warning("At least one value must be selected in each filter.")
         else:
             filters = {
@@ -578,7 +519,6 @@ def main():
                 filters,
                 st.session_state.fractional_bank,
             )
-
             st.session_state.fractional_bank = new_bank
 
             reached_icons_total = int((pop_df["contact_count"] > 0).sum())
@@ -599,69 +539,67 @@ def main():
             )
 
             if contacted_icons == 0:
-                st.warning(
-                    "No new icon-level contacts this step. "
-                    "This can happen when intended reach is small relative to 1 icon = 1,800 residents "
-                    "or eligibility is very narrow."
-                )
+                st.warning("No new icon-level contacts this step (small reach or narrow eligibility).")
             else:
                 st.success(f"Tactic applied: {contacted_icons} icons contacted (~{contacted_real:,} residents).")
 
-    # Plot
     pop_df["contact_status"] = pop_df["contact_count"].apply(contact_status)
 
-    color_map = {
-        "Never contacted": "#cbd5e1",
-        "Contacted once": "#60a5fa",
-        "Contacted twice": "#f59e0b",
-        "Contacted 3+ times": "#ef4444",
+    # Vega-Lite chart (no extra plotting library dependency)
+    vega_spec = {
+        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+        "height": 620,
+        "mark": {"type": "point", "filled": True, "size": 220, "stroke": "black", "strokeWidth": 0.6},
+        "encoding": {
+            "x": {
+                "field": "x",
+                "type": "quantitative",
+                "axis": None,
+                "scale": {"domain": [0.5, 10.5]},
+            },
+            "y": {
+                "field": "y",
+                "type": "quantitative",
+                "axis": None,
+                "scale": {"domain": [0.5, 10.5]},
+            },
+            "color": {
+                "field": "contact_status",
+                "type": "nominal",
+                "scale": {
+                    "domain": ["Never contacted", "Contacted once", "Contacted twice", "Contacted 3+ times"],
+                    "range": ["#cbd5e1", "#60a5fa", "#f59e0b", "#ef4444"],
+                },
+                "legend": {"title": "Contact frequency"},
+            },
+            "shape": {
+                "field": "vulnerability_level",
+                "type": "nominal",
+                "scale": {"domain": ["Low", "Medium", "High"], "range": ["circle", "square", "diamond"]},
+                "legend": {"title": "Heat vulnerability"},
+            },
+            "tooltip": [
+                {"field": "resident_id", "type": "quantitative", "title": "Resident ID"},
+                {"field": "age_group", "type": "nominal", "title": "Age"},
+                {"field": "primary_language", "type": "nominal", "title": "Primary language"},
+                {"field": "english_proficiency", "type": "nominal", "title": "English proficiency"},
+                {"field": "disability_status", "type": "nominal", "title": "Disability"},
+                {"field": "zip_code", "type": "nominal", "title": "ZIP"},
+                {"field": "occupation", "type": "nominal", "title": "Occupation"},
+                {"field": "housing_type", "type": "nominal", "title": "Housing"},
+                {"field": "cooling_access", "type": "nominal", "title": "Cooling"},
+                {"field": "tech_access", "type": "nominal", "title": "Tech access"},
+                {"field": "social_connectedness", "type": "nominal", "title": "Connectedness"},
+                {"field": "contact_count", "type": "quantitative", "title": "Contact count"},
+            ],
+        },
+        "config": {"view": {"stroke": None}},
     }
-    symbol_map = {"Low": "circle", "Medium": "square", "High": "diamond"}
 
-    fig = px.scatter(
-        pop_df,
-        x="x",
-        y="y",
-        color="contact_status",
-        symbol="vulnerability_level",
-        color_discrete_map=color_map,
-        symbol_map=symbol_map,
-        category_orders={
-            "contact_status": ["Never contacted", "Contacted once", "Contacted twice", "Contacted 3+ times"],
-            "vulnerability_level": ["Low", "Medium", "High"],
-        },
-        hover_data={
-            "resident_id": True,
-            "age_group": True,
-            "primary_language": True,
-            "english_proficiency": True,
-            "disability_status": True,
-            "zip_code": True,
-            "occupation": True,
-            "housing_type": True,
-            "cooling_access": True,
-            "tech_access": True,
-            "social_connectedness": True,
-            "vulnerability_level": True,
-            "contact_count": True,
-            "x": False,
-            "y": False,
-        },
-        title="Synthetic Santa Rosa Population (100 icons)",
-    )
+    st.subheader("Synthetic Santa Rosa Population (100 icons)")
+    st.caption("Color = contact frequency | Shape = heat vulnerability")
+    st.vega_lite_chart(pop_df, vega_spec, use_container_width=True)
 
-    fig.update_traces(marker=dict(size=17, line=dict(width=0.7, color="black")))
-    fig.update_layout(
-        height=650,
-        legend_title_text="Color = Contact frequency | Shape = Heat vulnerability",
-        margin=dict(l=10, r=10, t=60, b=10),
-    )
-    fig.update_xaxes(showticklabels=False, showgrid=False, visible=False, range=[0.5, 10.5])
-    fig.update_yaxes(showticklabels=False, showgrid=False, visible=False, range=[0.5, 10.5], scaleanchor="x", scaleratio=1)
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Summary metrics
     reached_icons = int((pop_df["contact_count"] > 0).sum())
     never_icons = POP_SIZE - reached_icons
     reached_pct = reached_icons / POP_SIZE * 100
@@ -673,10 +611,8 @@ def main():
     c3.metric("Never contacted icons", f"{never_icons}")
     c4.metric("Avg contacts/icon", f"{avg_contacts:.2f}")
 
-    # Missed breakdown
     st.subheader("Who is still being missed? (never-contacted icons)")
     missed = pop_df[pop_df["contact_count"] == 0].copy()
-
     if len(missed) == 0:
         st.success("All simulated residents have been contacted at least once.")
     else:
@@ -702,40 +638,29 @@ def main():
         bdf = bdf.sort_values("Count (icons)", ascending=False)
         st.dataframe(bdf, use_container_width=True, hide_index=True)
 
-    # History
     st.subheader("Tactic history")
     if len(st.session_state.history) == 0:
         st.write("No tactics applied yet.")
     else:
-        hdf = pd.DataFrame(st.session_state.history)
-        st.dataframe(hdf, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(st.session_state.history), use_container_width=True, hide_index=True)
 
-    # Data assumptions/sources
     with st.expander("Assumptions and data notes"):
         st.markdown(
             """
-- This app uses a **synthetic population** of 100 icons; each icon represents ~1,800 real residents.
-- Population is generated with a **fixed random seed**, so baseline residents are consistent every app load.
-- Demographic targets are approximate, based on Santa Rosa city ACS/Census profile patterns for:
-  - age structure
-  - language use / English proficiency
-  - disability prevalence
-  - housing and socioeconomic characteristics
-- Suggested source families for alignment: U.S. Census Bureau ACS 5-year profile tables (e.g., age/language/disability/housing/economy).
-- This is an exercise planning tool, not an operational forecast model.
+- Synthetic population of 100 icons; each icon ≈ 1,800 real residents.
+- Fixed random seed for reproducibility.
+- Approximate ACS/Census profile proportions used for realism in exercise context.
+- Planning/exercise tool; not an operational forecast model.
 """
         )
 
-    with st.expander("Quick check of synthetic population composition"):
+    with st.expander("Quick check of synthetic composition"):
         st.write("Age")
         st.dataframe(distribution_table(pop_df, "age_group", AGE_OPTIONS), use_container_width=True, hide_index=True)
-
         st.write("Primary language")
         st.dataframe(distribution_table(pop_df, "primary_language", LANG_OPTIONS), use_container_width=True, hide_index=True)
-
         st.write("Disability status")
         st.dataframe(distribution_table(pop_df, "disability_status", ["Yes", "No"]), use_container_width=True, hide_index=True)
-
         st.write("ZIP code")
         st.dataframe(distribution_table(pop_df, "zip_code", ZIP_OPTIONS), use_container_width=True, hide_index=True)
 
