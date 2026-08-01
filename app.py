@@ -1,12 +1,15 @@
-import streamlit as st
-import pandas as pd
+import re
+from copy import deepcopy
+
 import numpy as np
+import pandas as pd
+import streamlit as st
 
 # -----------------------------
 # Constants
 # -----------------------------
 POP_SIZE = 100
-REP_FACTOR = 1800  # each simulated resident represents ~1,800 real residents
+REP_FACTOR = 1800  # each icon ~1,800 real residents
 SEED = 20260801
 
 AGE_OPTIONS = ["0-17", "18-39", "40-64", "65+"]
@@ -21,6 +24,13 @@ OCC_OPTIONS = [
 ]
 VULN_OPTIONS = ["Low", "Medium", "High"]
 
+BASE_CONNECTION_ARCHETYPES = [
+    "Smartphone + internet",
+    "Smartphone (limited data)",
+    "Landline only",
+    "No reliable phone/internet",
+]
+
 CHANNEL_OPTIONS = [
     "SMS text",
     "Robocall (voice call)",
@@ -33,27 +43,59 @@ CHANNEL_OPTIONS = [
 
 MESSAGE_LANG_OPTIONS = ["English", "Spanish", "Vietnamese", "Tagalog", "Multilingual"]
 
+DEFAULT_CONFIG = {
+    "age_pct": {"0-17": 20, "18-39": 29, "40-64": 33, "65+": 18},
+    "language_pct": {"English": 72, "Spanish": 20, "Vietnamese": 3, "Tagalog": 2, "Other": 3},
+    "zip_pct": {"95401": 18, "95403": 24, "95404": 14, "95405": 10, "95407": 22, "95409": 12},
+    "disability_yes_pct": 12.0,
+}
 
-def allocate_counts_from_percent(percent_dict, n=100):
-    raw = {k: (v / 100.0) * n for k, v in percent_dict.items()}
-    floored = {k: int(np.floor(v)) for k, v in raw.items()}
-    remainder = n - sum(floored.values())
+DEFAULT_CONNECTION_LIBRARY = {
+    "Smartphone + internet": {"base": "Smartphone + internet", "pct": 68.0},
+    "Smartphone (limited data)": {"base": "Smartphone (limited data)", "pct": 16.0},
+    "Landline only": {"base": "Landline only", "pct": 10.0},
+    "No reliable phone/internet": {"base": "No reliable phone/internet", "pct": 6.0},
+}
 
-    frac_parts = sorted(
-        [(k, raw[k] - floored[k]) for k in raw.keys()],
-        key=lambda x: x[1],
-        reverse=True,
-    )
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def safe_key(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_]", "_", text)
+
+
+def do_rerun():
+    try:
+        st.rerun()
+    except Exception:
+        st.experimental_rerun()
+
+
+def counts_from_percentages(pct_dict, n=100):
+    keys = list(pct_dict.keys())
+    vals = np.array([max(0.0, float(pct_dict[k])) for k in keys], dtype=float)
+    if vals.sum() == 0:
+        vals = np.ones_like(vals)
+
+    norm = vals / vals.sum()
+    raw = norm * n
+    flo = np.floor(raw).astype(int)
+    remainder = n - int(flo.sum())
+
+    frac = raw - flo
+    idx_sorted = np.argsort(-frac)
     for i in range(remainder):
-        floored[frac_parts[i][0]] += 1
-    return floored
+        flo[idx_sorted[i]] += 1
+
+    return {keys[i]: int(flo[i]) for i in range(len(keys))}
 
 
 def expand_counts(count_dict):
-    vals = []
+    out = []
     for k, c in count_dict.items():
-        vals.extend([k] * c)
-    return vals
+        out.extend([k] * int(c))
+    return out
 
 
 def sample_from_probs(rng, prob_dict):
@@ -63,28 +105,63 @@ def sample_from_probs(rng, prob_dict):
     return rng.choice(keys, p=probs)
 
 
-@st.cache_data
-def generate_population(seed=SEED):
+def edit_pct_dict(title, pct_dict, key_prefix):
+    st.markdown(f"**{title}**")
+    cols = st.columns(3)
+    new_dict = {}
+    items = list(pct_dict.items())
+    for i, (k, v) in enumerate(items):
+        with cols[i % 3]:
+            new_val = st.number_input(
+                f"{k}",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(v),
+                step=0.5,
+                key=f"{key_prefix}_{safe_key(k)}",
+            )
+            new_dict[k] = float(new_val)
+
+    st.caption(f"Raw total entered: {sum(new_dict.values()):.1f}% (auto-normalized to 100% on generation)")
+    return new_dict
+
+
+def distribution_table(df, col, order=None):
+    if order is None:
+        counts = df[col].value_counts()
+    else:
+        counts = df[col].value_counts().reindex(order).fillna(0).astype(int)
+    return pd.DataFrame(
+        {
+            col: counts.index,
+            "Count (icons)": counts.values,
+            "Percent": (counts.values / len(df) * 100).round(1),
+        }
+    )
+
+
+# -----------------------------
+# Population generation
+# -----------------------------
+def generate_population(config, connection_library, seed=SEED):
     rng = np.random.default_rng(seed)
     n = POP_SIZE
 
-    age_counts = allocate_counts_from_percent(
-        {"0-17": 20, "18-39": 29, "40-64": 33, "65+": 18}, n
-    )
-    lang_counts = allocate_counts_from_percent(
-        {"English": 72, "Spanish": 20, "Vietnamese": 3, "Tagalog": 2, "Other": 3}, n
-    )
-    zip_counts = allocate_counts_from_percent(
-        {"95401": 18, "95403": 24, "95404": 14, "95405": 10, "95407": 22, "95409": 12}, n
-    )
+    age_counts = counts_from_percentages(config["age_pct"], n)
+    lang_counts = counts_from_percentages(config["language_pct"], n)
+    zip_counts = counts_from_percentages(config["zip_pct"], n)
+    conn_pct = {k: v["pct"] for k, v in connection_library.items()}
+    conn_counts = counts_from_percentages(conn_pct, n)
 
     ages = expand_counts(age_counts)
     langs = expand_counts(lang_counts)
     zips = expand_counts(zip_counts)
+    conns = expand_counts(conn_counts)
 
     rng.shuffle(ages)
     rng.shuffle(langs)
     rng.shuffle(zips)
+    rng.shuffle(conns)
 
     df = pd.DataFrame(
         {
@@ -92,9 +169,12 @@ def generate_population(seed=SEED):
             "age_group": ages,
             "primary_language": langs,
             "zip_code": zips,
+            "connection_type": conns,
         }
     )
+    df["connection_base"] = df["connection_type"].map(lambda x: connection_library[x]["base"])
 
+    # English proficiency (approx)
     limited_prob_by_language = {
         "English": 0.01,
         "Spanish": 0.45,
@@ -107,15 +187,19 @@ def generate_population(seed=SEED):
         for lang in df["primary_language"]
     ]
 
-    disability_target = 12
+    # Disability assignment (user-set %, weighted toward older ages)
+    target_yes = int(round((config["disability_yes_pct"] / 100.0) * n))
+    target_yes = max(0, min(n, target_yes))
     age_weight = {"0-17": 0.7, "18-39": 0.7, "40-64": 1.2, "65+": 2.3}
     w = df["age_group"].map(age_weight).astype(float).values
     w = w / w.sum()
-    yes_idx = rng.choice(df.index, size=disability_target, replace=False, p=w)
+    yes_idx = rng.choice(df.index, size=target_yes, replace=False, p=w) if target_yes > 0 else []
 
     df["disability_status"] = "No"
-    df.loc[yes_idx, "disability_status"] = "Yes"
+    if target_yes > 0:
+        df.loc[yes_idx, "disability_status"] = "Yes"
 
+    # Occupation
     occupations = []
     for _, row in df.iterrows():
         age = row["age_group"]
@@ -154,18 +238,13 @@ def generate_population(seed=SEED):
         occupations.append(sample_from_probs(rng, probs))
     df["occupation"] = occupations
 
+    # Housing type
     housing = []
     for _, row in df.iterrows():
         z = row["zip_code"]
         age = row["age_group"]
 
-        probs = {
-            "Single-family": 0.55,
-            "Apartment": 0.32,
-            "Mobile home": 0.10,
-            "Unhoused/temporary": 0.03,
-        }
-
+        probs = {"Single-family": 0.55, "Apartment": 0.32, "Mobile home": 0.10, "Unhoused/temporary": 0.03}
         if z == "95407":
             probs = {"Single-family": 0.42, "Apartment": 0.45, "Mobile home": 0.10, "Unhoused/temporary": 0.03}
         elif z == "95409":
@@ -179,6 +258,7 @@ def generate_population(seed=SEED):
         housing.append(sample_from_probs(rng, probs))
     df["housing_type"] = housing
 
+    # Cooling access
     cooling = []
     for _, row in df.iterrows():
         h = row["housing_type"]
@@ -193,51 +273,7 @@ def generate_population(seed=SEED):
         cooling.append(sample_from_probs(rng, probs))
     df["cooling_access"] = cooling
 
-    tech = []
-    for _, row in df.iterrows():
-        age = row["age_group"]
-        h = row["housing_type"]
-
-        if age == "0-17":
-            probs = {
-                "Smartphone + internet": 0.78,
-                "Smartphone (limited data)": 0.16,
-                "Landline only": 0.04,
-                "No reliable phone/internet": 0.02,
-            }
-        elif age == "18-39":
-            probs = {
-                "Smartphone + internet": 0.82,
-                "Smartphone (limited data)": 0.12,
-                "Landline only": 0.03,
-                "No reliable phone/internet": 0.03,
-            }
-        elif age == "40-64":
-            probs = {
-                "Smartphone + internet": 0.70,
-                "Smartphone (limited data)": 0.15,
-                "Landline only": 0.10,
-                "No reliable phone/internet": 0.05,
-            }
-        else:
-            probs = {
-                "Smartphone + internet": 0.45,
-                "Smartphone (limited data)": 0.14,
-                "Landline only": 0.30,
-                "No reliable phone/internet": 0.11,
-            }
-
-        if h == "Unhoused/temporary":
-            probs = {
-                "Smartphone + internet": 0.20,
-                "Smartphone (limited data)": 0.35,
-                "Landline only": 0.05,
-                "No reliable phone/internet": 0.40,
-            }
-
-        tech.append(sample_from_probs(rng, probs))
-    df["tech_access"] = tech
-
+    # Social connectedness
     connectedness = []
     for _, row in df.iterrows():
         age = row["age_group"]
@@ -264,6 +300,7 @@ def generate_population(seed=SEED):
         connectedness.append(sample_from_probs(rng, probs))
     df["social_connectedness"] = connectedness
 
+    # Vulnerability score
     def vulnerability_score(row):
         score = 0
         if row["age_group"] == "65+":
@@ -284,7 +321,7 @@ def generate_population(seed=SEED):
             score += 1
         if row["housing_type"] in ["Mobile home", "Unhoused/temporary"]:
             score += 1
-        if row["tech_access"] in ["Landline only", "No reliable phone/internet"]:
+        if row["connection_base"] in ["Landline only", "No reliable phone/internet"]:
             score += 1
         return score
 
@@ -293,14 +330,21 @@ def generate_population(seed=SEED):
         lambda s: "High" if s >= 6 else ("Medium" if s >= 3 else "Low")
     )
 
+    # Grid coordinates
     df["x"] = ((df["resident_id"] - 1) % 10) + 1
     df["y"] = 10 - ((df["resident_id"] - 1) // 10)
+
+    # Contact tracking
     df["contact_count"] = 0
+
     return df
 
 
+# -----------------------------
+# Communication logic
+# -----------------------------
 def channel_reach_prob(row, channel):
-    tech = row["tech_access"]
+    tech = row["connection_base"]
     soc = row["social_connectedness"]
     housing = row["housing_type"]
     age = row["age_group"]
@@ -346,10 +390,7 @@ def channel_reach_prob(row, channel):
         return float(np.clip(base, 0, 1))
 
     if channel == "Printed flyer/poster":
-        if housing == "Unhoused/temporary":
-            base = 0.30
-        else:
-            base = 0.65
+        base = 0.30 if housing == "Unhoused/temporary" else 0.65
         if soc == "Highly connected":
             base += 0.08
         return float(np.clip(base, 0, 1))
@@ -396,6 +437,7 @@ def apply_tactic(pop_df, rng, channel, message_language, intended_real_reach, fi
         & pop_df["vulnerability_level"].isin(filters["vulnerability_levels"])
         & pop_df["primary_language"].isin(filters["primary_languages"])
         & pop_df["disability_status"].isin(filters["disability_statuses"])
+        & pop_df["connection_type"].isin(filters["connection_types"])
     )
 
     targeted_count = int(mask.sum())
@@ -419,7 +461,6 @@ def apply_tactic(pop_df, rng, channel, message_language, intended_real_reach, fi
         return 0, 0, targeted_count, eligible_count, new_bank
 
     to_contact = min(to_contact, eligible_count)
-
     probs = weights[eligible_idx]
     probs = probs / probs.sum()
 
@@ -429,240 +470,381 @@ def apply_tactic(pop_df, rng, channel, message_language, intended_real_reach, fi
     return int(to_contact), int(to_contact * REP_FACTOR), targeted_count, eligible_count, new_bank
 
 
-def distribution_table(df, col, order=None):
-    if order is None:
-        counts = df[col].value_counts()
-    else:
-        counts = df[col].value_counts().reindex(order).fillna(0).astype(int)
-    out = pd.DataFrame(
-        {
-            col: counts.index,
-            "Count (sim residents)": counts.values,
-            "Percent": (counts.values / len(df) * 100).round(1),
-        }
-    )
-    return out
-
-
-def main():
-    st.set_page_config(page_title="Santa Rosa Heat Communication Simulation", layout="wide")
-    st.title("Santa Rosa Extreme Heat Communication Simulation")
-    st.caption("Live tabletop exercise tool for communication strategy testing")
-    st.info("Each icon = ~1,800 residents. Synthetic population size = 100.")
-
+# -----------------------------
+# App
+# -----------------------------
+def init_state():
+    if "config" not in st.session_state:
+        st.session_state.config = deepcopy(DEFAULT_CONFIG)
+    if "connection_library" not in st.session_state:
+        st.session_state.connection_library = deepcopy(DEFAULT_CONNECTION_LIBRARY)
     if "population" not in st.session_state:
-        st.session_state.population = generate_population().copy(deep=True)
+        st.session_state.population = generate_population(
+            st.session_state.config, st.session_state.connection_library, seed=SEED
+        )
     if "history" not in st.session_state:
         st.session_state.history = []
     if "rng" not in st.session_state:
         st.session_state.rng = np.random.default_rng(SEED)
     if "fractional_bank" not in st.session_state:
         st.session_state.fractional_bank = 0.0
+    if "population_locked" not in st.session_state:
+        st.session_state.population_locked = False
 
-    pop_df = st.session_state.population
 
-    with st.sidebar:
-        st.header("Tactic Builder")
-        channel = st.selectbox("Channel", CHANNEL_OPTIONS)
-        message_language = st.selectbox("Message language", MESSAGE_LANG_OPTIONS)
+def main():
+    st.set_page_config(page_title="Santa Rosa Heat Communication Simulation", layout="wide")
+    init_state()
 
-        intended_reach = st.slider(
-            "Intended reach (real residents)",
-            min_value=100,
-            max_value=50000,
-            value=1800,
-            step=100,
+    st.title("Santa Rosa Extreme Heat Communication Simulation")
+    st.info("Each icon = ~1,800 residents. Synthetic population size = 100.")
+
+    tabs = st.tabs(["1) Population Setup", "2) Run Communication Tactics", "3) Data Sources"])
+
+    # -----------------------------
+    # Tab 1: Population Setup
+    # -----------------------------
+    with tabs[0]:
+        st.subheader("Add / Edit Population Profile")
+        st.caption("Enter percentages. They do not need to sum to 100; the app auto-normalizes.")
+
+        st.session_state.config["age_pct"] = edit_pct_dict(
+            "Age distribution (%)", st.session_state.config["age_pct"], "agepct"
         )
-        st.caption(f"Equivalent to {intended_reach / REP_FACTOR:.2f} icons")
+        st.session_state.config["language_pct"] = edit_pct_dict(
+            "Primary language distribution (%)", st.session_state.config["language_pct"], "langpct"
+        )
+        st.session_state.config["zip_pct"] = edit_pct_dict(
+            "ZIP distribution (%)", st.session_state.config["zip_pct"], "zippct"
+        )
 
-        st.subheader("Optional targeting filters")
-        age_filter = st.multiselect("Age groups", AGE_OPTIONS, default=AGE_OPTIONS)
-        zip_filter = st.multiselect("ZIP codes", ZIP_OPTIONS, default=ZIP_OPTIONS)
-        occ_filter = st.multiselect("Occupation", OCC_OPTIONS, default=OCC_OPTIONS)
-        vuln_filter = st.multiselect("Vulnerability level", VULN_OPTIONS, default=VULN_OPTIONS)
-        lang_filter = st.multiselect("Primary language", LANG_OPTIONS, default=LANG_OPTIONS)
-        dis_filter = st.multiselect("Disability status", ["Yes", "No"], default=["Yes", "No"])
-
-        apply_btn = st.button("Apply tactic", type="primary")
-        reset_btn = st.button("Reset scenario")
-
-    if reset_btn:
-        st.session_state.population = generate_population().copy(deep=True)
-        st.session_state.history = []
-        st.session_state.rng = np.random.default_rng(SEED)
-        st.session_state.fractional_bank = 0.0
-        st.success("Scenario reset complete.")
-        if hasattr(st, "rerun"):
-            st.rerun()
-        else:
-            st.experimental_rerun()
-
-    if apply_btn:
-        if any(len(x) == 0 for x in [age_filter, zip_filter, occ_filter, vuln_filter, lang_filter, dis_filter]):
-            st.warning("At least one value must be selected in each filter.")
-        else:
-            filters = {
-                "age_groups": age_filter,
-                "zip_codes": zip_filter,
-                "occupations": occ_filter,
-                "vulnerability_levels": vuln_filter,
-                "primary_languages": lang_filter,
-                "disability_statuses": dis_filter,
-            }
-
-            contacted_icons, contacted_real, targeted_count, eligible_count, new_bank = apply_tactic(
-                pop_df,
-                st.session_state.rng,
-                channel,
-                message_language,
-                intended_reach,
-                filters,
-                st.session_state.fractional_bank,
+        st.session_state.config["disability_yes_pct"] = float(
+            st.number_input(
+                "Disability prevalence (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(st.session_state.config["disability_yes_pct"]),
+                step=0.5,
+                key="disability_yes_pct",
             )
-            st.session_state.fractional_bank = new_bank
+        )
 
-            reached_icons_total = int((pop_df["contact_count"] > 0).sum())
-            reached_pct_total = reached_icons_total / POP_SIZE * 100
+        st.markdown("---")
+        st.subheader("Add Connection Type Section")
+        st.caption("You can add custom connection types and map them to a base delivery behavior.")
 
-            st.session_state.history.append(
-                {
-                    "Step": len(st.session_state.history) + 1,
-                    "Channel": channel,
-                    "Language": message_language,
-                    "Intended reach (real)": intended_reach,
-                    "Targeted icons": targeted_count,
-                    "Eligible icons": eligible_count,
-                    "Contacted this step (icons)": contacted_icons,
-                    "Contacted this step (real approx)": contacted_real,
-                    "Cumulative reached %": round(reached_pct_total, 1),
-                }
-            )
+        lib = st.session_state.connection_library
+        for label in list(lib.keys()):
+            sk = safe_key(label)
+            c1, c2 = st.columns([1.1, 1.4])
+            with c1:
+                pct_val = st.number_input(
+                    f"{label} (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=float(lib[label]["pct"]),
+                    step=0.5,
+                    key=f"connpct_{sk}",
+                )
+            with c2:
+                base_idx = BASE_CONNECTION_ARCHETYPES.index(lib[label]["base"])
+                base_val = st.selectbox(
+                    f"{label} behavior map",
+                    BASE_CONNECTION_ARCHETYPES,
+                    index=base_idx,
+                    key=f"connbase_{sk}",
+                )
+            lib[label]["pct"] = float(pct_val)
+            lib[label]["base"] = base_val
 
-            if contacted_icons == 0:
-                st.warning("No new icon-level contacts this step (small reach or narrow eligibility).")
+        st.caption(
+            f"Raw connection total entered: {sum([v['pct'] for v in lib.values()]):.1f}% "
+            "(auto-normalized to 100% on generation)"
+        )
+
+        with st.expander("➕ Add a new custom connection type"):
+            new_name = st.text_input("Connection type name", placeholder="e.g., Family phone tree")
+            new_base = st.selectbox("Map behavior to", BASE_CONNECTION_ARCHETYPES, key="new_conn_base")
+            new_pct = st.number_input("Initial %", 0.0, 100.0, 2.0, 0.5, key="new_conn_pct")
+            if st.button("Add connection type"):
+                nm = new_name.strip()
+                if nm == "":
+                    st.warning("Please enter a name.")
+                elif nm in lib:
+                    st.warning("That connection type already exists.")
+                else:
+                    lib[nm] = {"base": new_base, "pct": float(new_pct)}
+                    st.success(f"Added '{nm}'.")
+                    do_rerun()
+
+        custom_types = [k for k in lib.keys() if k not in BASE_CONNECTION_ARCHETYPES]
+        with st.expander("🗑 Remove custom connection type"):
+            if len(custom_types) == 0:
+                st.caption("No custom connection types yet.")
             else:
-                st.success(f"Tactic applied: {contacted_icons} icons contacted (~{contacted_real:,} residents).")
+                rm = st.selectbox("Select custom type to remove", custom_types)
+                if st.button("Remove selected connection type"):
+                    del lib[rm]
+                    st.success(f"Removed '{rm}'.")
+                    do_rerun()
 
-    pop_df["contact_status"] = pop_df["contact_count"].apply(contact_status)
+        st.markdown("---")
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            if st.button("Generate / Regenerate population", type="primary"):
+                st.session_state.population = generate_population(
+                    st.session_state.config, st.session_state.connection_library, seed=SEED
+                )
+                st.session_state.history = []
+                st.session_state.fractional_bank = 0.0
+                st.session_state.rng = np.random.default_rng(SEED)
+                st.session_state.population_locked = False
+                st.success("Population generated. Review below, then lock to begin tactics.")
+        with b2:
+            if st.button("Lock population & start tactics"):
+                st.session_state.population_locked = True
+                st.success("Population locked. Go to 'Run Communication Tactics'.")
+        with b3:
+            if st.button("Unlock population for editing"):
+                st.session_state.population_locked = False
+                st.warning("Population unlocked. Re-lock before running tactics.")
 
-    # Vega-Lite chart (no extra plotting library dependency)
-    vega_spec = {
-        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
-        "height": 620,
-        "mark": {"type": "point", "filled": True, "size": 220, "stroke": "black", "strokeWidth": 0.6},
-        "encoding": {
-            "x": {
-                "field": "x",
-                "type": "quantitative",
-                "axis": None,
-                "scale": {"domain": [0.5, 10.5]},
-            },
-            "y": {
-                "field": "y",
-                "type": "quantitative",
-                "axis": None,
-                "scale": {"domain": [0.5, 10.5]},
-            },
-            "color": {
-                "field": "contact_status",
-                "type": "nominal",
-                "scale": {
-                    "domain": ["Never contacted", "Contacted once", "Contacted twice", "Contacted 3+ times"],
-                    "range": ["#cbd5e1", "#60a5fa", "#f59e0b", "#ef4444"],
+        lock_msg = "LOCKED ✅" if st.session_state.population_locked else "UNLOCKED ⚠️"
+        st.write(f"Current status: **{lock_msg}**")
+
+        st.subheader("Population Preview")
+        p = st.session_state.population
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write("Age")
+            st.dataframe(distribution_table(p, "age_group", AGE_OPTIONS), use_container_width=True, hide_index=True)
+            st.write("Language")
+            st.dataframe(distribution_table(p, "primary_language", LANG_OPTIONS), use_container_width=True, hide_index=True)
+            st.write("Disability")
+            st.dataframe(distribution_table(p, "disability_status", ["Yes", "No"]), use_container_width=True, hide_index=True)
+        with c2:
+            st.write("ZIP")
+            st.dataframe(distribution_table(p, "zip_code", ZIP_OPTIONS), use_container_width=True, hide_index=True)
+            st.write("Connection type")
+            st.dataframe(
+                distribution_table(p, "connection_type", list(st.session_state.connection_library.keys())),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    # -----------------------------
+    # Tab 2: Tactics
+    # -----------------------------
+    with tabs[1]:
+        pop_df = st.session_state.population
+        pop_df["contact_status"] = pop_df["contact_count"].apply(contact_status)
+
+        if not st.session_state.population_locked:
+            st.warning("Population is unlocked. Lock it in Tab 1 before applying communication tactics.")
+
+        left, right = st.columns([1.05, 1.95])
+
+        with left:
+            st.subheader("Tactic Builder")
+            channel = st.selectbox("Channel", CHANNEL_OPTIONS)
+            message_language = st.selectbox("Message language", MESSAGE_LANG_OPTIONS)
+            intended_reach = st.slider(
+                "Intended reach (real residents)",
+                min_value=100,
+                max_value=50000,
+                value=1800,
+                step=100,
+            )
+            st.caption(f"Equivalent to {intended_reach / REP_FACTOR:.2f} icons")
+
+            st.markdown("**Targeting filters**")
+            age_filter = st.multiselect("Age groups", AGE_OPTIONS, default=AGE_OPTIONS)
+            zip_filter = st.multiselect("ZIP codes", ZIP_OPTIONS, default=ZIP_OPTIONS)
+            occ_filter = st.multiselect("Occupation", OCC_OPTIONS, default=OCC_OPTIONS)
+            vuln_filter = st.multiselect("Vulnerability level", VULN_OPTIONS, default=VULN_OPTIONS)
+            lang_filter = st.multiselect("Primary language", LANG_OPTIONS, default=LANG_OPTIONS)
+            dis_filter = st.multiselect("Disability status", ["Yes", "No"], default=["Yes", "No"])
+            conn_options = sorted(pop_df["connection_type"].unique().tolist())
+            conn_filter = st.multiselect("Connection type", conn_options, default=conn_options)
+
+            apply_btn = st.button("Apply tactic", type="primary", disabled=not st.session_state.population_locked)
+            reset_btn = st.button("Reset contacts (keep population)")
+
+            if reset_btn:
+                st.session_state.population["contact_count"] = 0
+                st.session_state.history = []
+                st.session_state.fractional_bank = 0.0
+                st.session_state.rng = np.random.default_rng(SEED)
+                st.success("Contacts reset. Population unchanged.")
+                do_rerun()
+
+            if apply_btn:
+                if any(len(x) == 0 for x in [age_filter, zip_filter, occ_filter, vuln_filter, lang_filter, dis_filter, conn_filter]):
+                    st.warning("Each filter must have at least one selected value.")
+                else:
+                    filters = {
+                        "age_groups": age_filter,
+                        "zip_codes": zip_filter,
+                        "occupations": occ_filter,
+                        "vulnerability_levels": vuln_filter,
+                        "primary_languages": lang_filter,
+                        "disability_statuses": dis_filter,
+                        "connection_types": conn_filter,
+                    }
+
+                    contacted_icons, contacted_real, targeted_count, eligible_count, new_bank = apply_tactic(
+                        st.session_state.population,
+                        st.session_state.rng,
+                        channel,
+                        message_language,
+                        intended_reach,
+                        filters,
+                        st.session_state.fractional_bank,
+                    )
+                    st.session_state.fractional_bank = new_bank
+
+                    reached_icons_total = int((st.session_state.population["contact_count"] > 0).sum())
+                    reached_pct_total = reached_icons_total / POP_SIZE * 100
+
+                    st.session_state.history.append(
+                        {
+                            "Step": len(st.session_state.history) + 1,
+                            "Channel": channel,
+                            "Language": message_language,
+                            "Intended reach (real)": intended_reach,
+                            "Targeted icons": targeted_count,
+                            "Eligible icons": eligible_count,
+                            "Contacted this step (icons)": contacted_icons,
+                            "Contacted this step (real approx)": contacted_real,
+                            "Cumulative reached %": round(reached_pct_total, 1),
+                        }
+                    )
+
+                    if contacted_icons == 0:
+                        st.warning("No new icon-level contacts this step (small reach or narrow eligibility).")
+                    else:
+                        st.success(f"Applied: {contacted_icons} icons contacted (~{contacted_real:,} residents).")
+                    do_rerun()
+
+        with right:
+            p2 = st.session_state.population.copy()
+            p2["contact_status"] = p2["contact_count"].apply(contact_status)
+
+            vega_spec = {
+                "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+                "height": 620,
+                "mark": {"type": "point", "filled": True, "size": 220, "stroke": "black", "strokeWidth": 0.6},
+                "encoding": {
+                    "x": {"field": "x", "type": "quantitative", "axis": None, "scale": {"domain": [0.5, 10.5]}},
+                    "y": {"field": "y", "type": "quantitative", "axis": None, "scale": {"domain": [0.5, 10.5]}},
+                    "color": {
+                        "field": "contact_status",
+                        "type": "nominal",
+                        "scale": {
+                            "domain": ["Never contacted", "Contacted once", "Contacted twice", "Contacted 3+ times"],
+                            "range": ["#cbd5e1", "#60a5fa", "#f59e0b", "#ef4444"],
+                        },
+                        "legend": {"title": "Contact frequency"},
+                    },
+                    "shape": {
+                        "field": "vulnerability_level",
+                        "type": "nominal",
+                        "scale": {"domain": ["Low", "Medium", "High"], "range": ["circle", "square", "diamond"]},
+                        "legend": {"title": "Heat vulnerability"},
+                    },
+                    "tooltip": [
+                        {"field": "resident_id", "type": "quantitative", "title": "Resident ID"},
+                        {"field": "age_group", "type": "nominal", "title": "Age"},
+                        {"field": "primary_language", "type": "nominal", "title": "Language"},
+                        {"field": "english_proficiency", "type": "nominal", "title": "English proficiency"},
+                        {"field": "disability_status", "type": "nominal", "title": "Disability"},
+                        {"field": "zip_code", "type": "nominal", "title": "ZIP"},
+                        {"field": "occupation", "type": "nominal", "title": "Occupation"},
+                        {"field": "connection_type", "type": "nominal", "title": "Connection type"},
+                        {"field": "connection_base", "type": "nominal", "title": "Connection base"},
+                        {"field": "cooling_access", "type": "nominal", "title": "Cooling"},
+                        {"field": "social_connectedness", "type": "nominal", "title": "Connectedness"},
+                        {"field": "contact_count", "type": "quantitative", "title": "Contact count"},
+                    ],
                 },
-                "legend": {"title": "Contact frequency"},
-            },
-            "shape": {
-                "field": "vulnerability_level",
-                "type": "nominal",
-                "scale": {"domain": ["Low", "Medium", "High"], "range": ["circle", "square", "diamond"]},
-                "legend": {"title": "Heat vulnerability"},
-            },
-            "tooltip": [
-                {"field": "resident_id", "type": "quantitative", "title": "Resident ID"},
-                {"field": "age_group", "type": "nominal", "title": "Age"},
-                {"field": "primary_language", "type": "nominal", "title": "Primary language"},
-                {"field": "english_proficiency", "type": "nominal", "title": "English proficiency"},
-                {"field": "disability_status", "type": "nominal", "title": "Disability"},
-                {"field": "zip_code", "type": "nominal", "title": "ZIP"},
-                {"field": "occupation", "type": "nominal", "title": "Occupation"},
-                {"field": "housing_type", "type": "nominal", "title": "Housing"},
-                {"field": "cooling_access", "type": "nominal", "title": "Cooling"},
-                {"field": "tech_access", "type": "nominal", "title": "Tech access"},
-                {"field": "social_connectedness", "type": "nominal", "title": "Connectedness"},
-                {"field": "contact_count", "type": "quantitative", "title": "Contact count"},
-            ],
-        },
-        "config": {"view": {"stroke": None}},
-    }
-
-    st.subheader("Synthetic Santa Rosa Population (100 icons)")
-    st.caption("Color = contact frequency | Shape = heat vulnerability")
-    st.vega_lite_chart(pop_df, vega_spec, use_container_width=True)
-
-    reached_icons = int((pop_df["contact_count"] > 0).sum())
-    never_icons = POP_SIZE - reached_icons
-    reached_pct = reached_icons / POP_SIZE * 100
-    avg_contacts = pop_df["contact_count"].mean()
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Population reached", f"{reached_pct:.1f}%")
-    c2.metric("Reached (real approx)", f"{reached_icons * REP_FACTOR:,}")
-    c3.metric("Never contacted icons", f"{never_icons}")
-    c4.metric("Avg contacts/icon", f"{avg_contacts:.2f}")
-
-    st.subheader("Who is still being missed? (never-contacted icons)")
-    missed = pop_df[pop_df["contact_count"] == 0].copy()
-    if len(missed) == 0:
-        st.success("All simulated residents have been contacted at least once.")
-    else:
-        breakdown = {
-            "Age 65+": (missed["age_group"] == "65+").sum(),
-            "Limited English proficiency": (missed["english_proficiency"] == "Limited").sum(),
-            "Disability status = Yes": (missed["disability_status"] == "Yes").sum(),
-            "Low/no cooling (fan only or no cooling)": missed["cooling_access"].isin(["Fan only", "No cooling"]).sum(),
-            "Socially isolated": (missed["social_connectedness"] == "Isolated").sum(),
-            "Outdoor workers": (missed["occupation"] == "Outdoor worker").sum(),
-            "Low tech access (landline only/no reliable)": missed["tech_access"].isin(
-                ["Landline only", "No reliable phone/internet"]
-            ).sum(),
-        }
-
-        bdf = pd.DataFrame(
-            {
-                "Vulnerability trait among never-contacted": list(breakdown.keys()),
-                "Count (icons)": list(breakdown.values()),
+                "config": {"view": {"stroke": None}},
             }
-        )
-        bdf["Approx real residents"] = bdf["Count (icons)"] * REP_FACTOR
-        bdf = bdf.sort_values("Count (icons)", ascending=False)
-        st.dataframe(bdf, use_container_width=True, hide_index=True)
 
-    st.subheader("Tactic history")
-    if len(st.session_state.history) == 0:
-        st.write("No tactics applied yet.")
-    else:
-        st.dataframe(pd.DataFrame(st.session_state.history), use_container_width=True, hide_index=True)
+            st.subheader("Synthetic Population Grid")
+            st.caption("Color = contact frequency | Shape = vulnerability")
+            st.vega_lite_chart(p2, vega_spec, use_container_width=True)
 
-    with st.expander("Assumptions and data notes"):
+            reached_icons = int((p2["contact_count"] > 0).sum())
+            never_icons = POP_SIZE - reached_icons
+            reached_pct = reached_icons / POP_SIZE * 100
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Population reached", f"{reached_pct:.1f}%")
+            c2.metric("Reached (real approx)", f"{reached_icons * REP_FACTOR:,}")
+            c3.metric("Never contacted icons", f"{never_icons}")
+            c4.metric("Avg contacts/icon", f"{p2['contact_count'].mean():.2f}")
+
+            st.markdown("### Who is still being missed? (never-contacted)")
+            missed = p2[p2["contact_count"] == 0].copy()
+            if len(missed) == 0:
+                st.success("All icons contacted at least once.")
+            else:
+                breakdown = {
+                    "Age 65+": int((missed["age_group"] == "65+").sum()),
+                    "Limited English proficiency": int((missed["english_proficiency"] == "Limited").sum()),
+                    "Disability = Yes": int((missed["disability_status"] == "Yes").sum()),
+                    "Low/no cooling": int(missed["cooling_access"].isin(["Fan only", "No cooling"]).sum()),
+                    "Isolated": int((missed["social_connectedness"] == "Isolated").sum()),
+                    "Outdoor workers": int((missed["occupation"] == "Outdoor worker").sum()),
+                    "Low connectivity (landline/none)": int(
+                        missed["connection_base"].isin(["Landline only", "No reliable phone/internet"]).sum()
+                    ),
+                }
+                bdf = pd.DataFrame(
+                    {
+                        "Trait among never-contacted": list(breakdown.keys()),
+                        "Count (icons)": list(breakdown.values()),
+                    }
+                ).sort_values("Count (icons)", ascending=False)
+                bdf["Approx real residents"] = bdf["Count (icons)"] * REP_FACTOR
+                st.dataframe(bdf, use_container_width=True, hide_index=True)
+
+            st.markdown("### Tactic history")
+            if len(st.session_state.history) == 0:
+                st.write("No tactics applied yet.")
+            else:
+                st.dataframe(pd.DataFrame(st.session_state.history), use_container_width=True, hide_index=True)
+
+    # -----------------------------
+    # Tab 3: Data Sources
+    # -----------------------------
+    with tabs[2]:
+        st.subheader("Data Sources & Assumptions")
+
+        source_rows = [
+            ["Total population scaling", "Census city population estimate / ACS profile", "Set to 180,000 for scenario scaling (100 icons x 1,800)."],
+            ["Age distribution", "ACS S0101 / DP05", "Used as editable default percentages."],
+            ["Primary language", "ACS S1601 / B16001", "Used as editable default percentages."],
+            ["English proficiency", "ACS S1601 / B16004", "Applied via language-specific LEP probabilities."],
+            ["Disability prevalence", "ACS S1810", "Single editable percentage, then assigned with age-weighting."],
+            ["ZIP distribution", "ACS ZCTA pop (e.g., B01003) + local crosswalk method", "Used as editable default ZIP mix."],
+            ["Occupation", "ACS S2401 + modeled mapping", "Mapped into exercise categories (outdoor, remote, retired, etc.)."],
+            ["Housing type", "ACS B25024 / S2504 + modeled assumptions", "Generated by ZIP/age conditional distributions."],
+            ["Cooling access", "Modeled (proxy-based)", "Not directly a single ACS field; proxied by housing context."],
+            ["Connection type", "ACS S2801 / B28002 + modeled mapping", "Editable section; channel behavior maps to 4 base archetypes."],
+            ["Social connectedness", "Modeled proxy", "Proxy logic using age, LEP, disability."],
+        ]
+        sdf = pd.DataFrame(source_rows, columns=["Variable", "Source (ACS/Census)", "How used in app"])
+        st.dataframe(sdf, use_container_width=True, hide_index=True)
+
         st.markdown(
             """
-- Synthetic population of 100 icons; each icon ≈ 1,800 real residents.
-- Fixed random seed for reproducibility.
-- Approximate ACS/Census profile proportions used for realism in exercise context.
-- Planning/exercise tool; not an operational forecast model.
+**Notes**
+- This tool uses a **synthetic population** for tabletop planning.
+- Core demographic defaults align to ACS/Census-style profiles, but some fields are **modeled assumptions**.
+- All data are generated inside code (no external files needed for deployment).
 """
         )
-
-    with st.expander("Quick check of synthetic composition"):
-        st.write("Age")
-        st.dataframe(distribution_table(pop_df, "age_group", AGE_OPTIONS), use_container_width=True, hide_index=True)
-        st.write("Primary language")
-        st.dataframe(distribution_table(pop_df, "primary_language", LANG_OPTIONS), use_container_width=True, hide_index=True)
-        st.write("Disability status")
-        st.dataframe(distribution_table(pop_df, "disability_status", ["Yes", "No"]), use_container_width=True, hide_index=True)
-        st.write("ZIP code")
-        st.dataframe(distribution_table(pop_df, "zip_code", ZIP_OPTIONS), use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
